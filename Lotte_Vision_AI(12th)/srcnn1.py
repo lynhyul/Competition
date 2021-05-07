@@ -182,7 +182,7 @@ def BGR2RGB(img):
 
 
 for j in range(start1,end1) :
-    for i in range(24) :
+    for i in range(24) :    # 폴더 안 사진의 갯수
         b = 48+i
         c = 24*(j-start1) + i
         predict = BGR2RGB(output[c])
