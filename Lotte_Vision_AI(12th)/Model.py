@@ -137,9 +137,9 @@ model.compile(loss='categorical_crossentropy', optimizer=OPTIMIZER,
                 metrics=['acc'])
 
 t1 = time()       
-# history = model.fit_generator(train_generator,
-#     validation_data=valid_generator, epochs=EPOCH, steps_per_epoch=len(x_train) / 32, 
-#                     validation_steps=len(valid_generator),callbacks=[early_stopping,lr,cp])
+ history = model.fit_generator(train_generator,
+     validation_data=valid_generator, epochs=EPOCH, steps_per_epoch=len(x_train) / 32, 
+                     validation_steps=len(valid_generator),callbacks=[early_stopping,lr,cp])
 
 t2 = time()
 
