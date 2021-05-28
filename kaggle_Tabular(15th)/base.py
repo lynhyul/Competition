@@ -1,74 +1,287 @@
-import numpy as np
 import pandas as pd
-
-train = pd.read_csv('C:/data/kaggle/input/tabular-playground-series-apr-2021/train.csv')
-test = pd.read_csv('C:/data/kaggle/input/tabular-playground-series-apr-2021/test.csv')
-
-# This Python 3 environment comes with many helpful analytics libraries installed
-# It is defined by the kaggle/python Docker image: https://github.com/kaggle/docker-python
-# For example, here's several helpful packages to load
-
-import numpy as np # linear algebra
-import pandas as pd # data processing, CSV file I/O (e.g. pd.read_csv)
-
-# Input data files are available in the read-only "../input/" directory
-# For example, running this (by clicking run or pressing Shift+Enter) will list all files under the input directory
-
+import numpy as np
+import random
 import os
-for dirname, _, filenames in os.walk('/kaggle/input'):
-    for filename in filenames:
-        print(os.path.join(dirname, filename))
 
-sample_submission = pd.read_csv('C:/data/kaggle/input/tabular-playground-series-apr-2021/sample_submission.csv')
-y_train = train['Survived']
-X_train = train.drop(['Survived','PassengerId'], axis=1)
-X_test = test.drop(['PassengerId'], axis=1)
-X_train['Cabin'] = X_train['Cabin'].fillna('X').map(lambda x: x[0:5].strip())
-X_test['Cabin'] = X_test['Cabin'].fillna('X').map(lambda x: x[0:5].strip())
+from sklearn.metrics import accuracy_score
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.model_selection import train_test_split, KFold, StratifiedKFold
 
-X_train['Name'] = X_train['Name'].fillna('X').map(lambda x: x.split(',')[0])
-X_test['Name'] = X_test['Name'].fillna('X').map(lambda x: x.split(',')[0])
+import lightgbm as lgb
+import catboost as ctb
+from sklearn.model_selection import GridSearchCV
+from sklearn.tree import DecisionTreeClassifier, export_graphviz
 
-X_train[['Age','Fare']] = X_train[['Age','Fare']].fillna(X_train[['Age','Fare']].median())
-X_test[['Age','Fare']] = X_test[['Age','Fare']].fillna(X_test[['Age','Fare']].median())
+import graphviz
+import matplotlib.pyplot as plt
+import seaborn as sns
 
-from sklearn.impute import SimpleImputer
+import warnings
+warnings.simplefilter('ignore')
+from lightgbm import LGBMClassifier
+from xgboost import XGBClassifier
 
-imp = SimpleImputer(strategy="most_frequent")
+TARGET = 'Survived'
 
-X_train = pd.DataFrame(imp.fit_transform(X_train), columns=X_train.columns)
-X_test = pd.DataFrame(imp.fit_transform(X_test),  columns=X_test.columns)
-from sklearn import preprocessing
+N_ESTIMATORS = 1000
+N_SPLITS = 10
+SEED = 2021
+EARLY_STOPPING_ROUNDS = 100
+VERBOSE = 100
 
-enc = preprocessing.OrdinalEncoder()
+def set_seed(seed=42):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    
+set_seed(SEED)
 
-enc.fit(X_train[['Sex','Cabin','Name','Ticket', 'Embarked']])
-X_train[['Sex','Cabin','Name','Ticket','Embarked']] = enc.transform(X_train[['Sex','Cabin','Name','Ticket','Embarked']])
+train_df = pd.read_csv('c:/data/kaggle/input/tabular-playground-series-apr-2021/train.csv')
+test_df = pd.read_csv('c:/data/kaggle/input/tabular-playground-series-apr-2021/test.csv')
+submission = pd.read_csv('c:/data/kaggle/input/tabular-playground-series-apr-2021/sample_submission.csv')
+test_df[TARGET] = pd.read_csv("c:/data/kaggle/input/tabular-playground-series-apr-2021/pseudo_label.csv")[TARGET]
+
+all_df = pd.concat([train_df, test_df]).reset_index(drop=True)
+
+# Age fillna with mean age for each class
+all_df['Age'] = all_df['Age'].fillna(all_df['Age'].mean())
+
+# Cabin, fillna with 'X' and take first letter
+all_df['Cabin'] = all_df['Cabin'].fillna('X').map(lambda x: x[0].strip())
+
+# Ticket, fillna with 'X', split string and take first split 
+all_df['Ticket'] = all_df['Ticket'].fillna('X').map(lambda x:str(x).split()[0] if len(str(x).split()) > 1 else 'X')
+
+# Fare, fillna with mean value
+fare_map = all_df[['Fare', 'Pclass']].dropna().groupby('Pclass').median().to_dict()
+all_df['Fare'] = all_df['Fare'].fillna(all_df['Pclass'].map(fare_map['Fare']))
+all_df['Fare'] = np.log1p(all_df['Fare'])
+
+# Embarked, fillna with 'X' value
+all_df['Embarked'] = all_df['Embarked'].fillna('X')
+
+# Name, take only surnames
+all_df['Name'] = all_df['Name'].map(lambda x: x.split(',')[0])
+
+label_cols = ['Name', 'Ticket', 'Sex']
+onehot_cols = ['Cabin', 'Embarked']
+numerical_cols = ['Pclass', 'Age', 'SibSp', 'Parch', 'Fare']
+
+def label_encoder(c):
+    le = LabelEncoder()
+    return le.fit_transform(c)
+
+scaler = StandardScaler()
+
+onehot_encoded_df = pd.get_dummies(all_df[onehot_cols])
+label_encoded_df = all_df[label_cols].apply(label_encoder)
+numerical_df = pd.DataFrame(scaler.fit_transform(all_df[numerical_cols]), columns=numerical_cols)
+target_df = all_df[TARGET]
+
+all_df = pd.concat([numerical_df, label_encoded_df, onehot_encoded_df, target_df], axis=1)
+
+params = {
+    'metric': 'binary_logloss',
+    'n_estimators': N_ESTIMATORS,
+    'objective': 'binary',
+    'random_state': SEED,
+    'learning_rate': 0.01,
+    'min_child_samples': 150,
+    'reg_alpha': 3e-5,
+    'reg_lambda': 9e-2,
+    'num_leaves': 20,
+    'max_depth': 16,
+    'colsample_bytree': 0.8,
+    'subsample': 0.8,
+    'subsample_freq': 2,
+    'max_bin': 240,
+}
+
+lgb_oof = np.zeros(train_df.shape[0])
+lgb_preds = np.zeros(test_df.shape[0])
+feature_importances = pd.DataFrame()
+
+skf = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=SEED)
+
+for fold, (train_idx, valid_idx) in enumerate(skf.split(all_df, all_df[TARGET])):
+    print(f"===== FOLD {fold} =====")
+    oof_idx = np.array([idx for idx in valid_idx if idx < train_df.shape[0]])
+    preds_idx = np.array([idx for idx in valid_idx if idx >= train_df.shape[0]])
+
+    X_train, y_train = all_df.iloc[train_idx].drop(TARGET, axis=1), all_df.iloc[train_idx][TARGET]
+    X_valid, y_valid = all_df.iloc[oof_idx].drop(TARGET, axis=1), all_df.iloc[oof_idx][TARGET]
+    X_test = all_df.iloc[preds_idx].drop(TARGET, axis=1)
+    
+    pre_model = lgb.LGBMRegressor(**params)
+    pre_model.fit(
+        X_train, y_train,
+        eval_set=[(X_train, y_train),(X_valid, y_valid)],
+        early_stopping_rounds=EARLY_STOPPING_ROUNDS,
+        verbose=VERBOSE
+    )
+
+    params2 = params.copy()
+    params2['learning_rate'] = params['learning_rate'] * 0.1
+    model = lgb.LGBMRegressor(**params2)
+    model.fit(
+        X_train, y_train,
+        eval_set=[(X_train, y_train),(X_valid, y_valid)],
+        early_stopping_rounds=EARLY_STOPPING_ROUNDS,
+        verbose=VERBOSE,
+        init_model=pre_model
+    )
+    
+    fi_tmp = pd.DataFrame()
+    fi_tmp["feature"] = model.feature_name_
+    fi_tmp["importance"] = model.feature_importances_
+    fi_tmp["fold"] = fold
+    fi_tmp["seed"] = SEED
+    feature_importances = feature_importances.append(fi_tmp)
+    
+    lgb_oof[oof_idx] = model.predict(X_valid)
+    lgb_preds[preds_idx-train_df.shape[0]] = model.predict(X_test)
+    
+    acc_score = accuracy_score(y_valid, np.where(lgb_oof[oof_idx]>0.5, 1, 0))
+    print(f"===== ACCURACY SCORE {acc_score:.6f} =====\n")
+    
+acc_score = accuracy_score(all_df[:train_df.shape[0]][TARGET], np.where(lgb_oof>0.5, 1, 0))
+print(f"===== ACCURACY SCORE {acc_score:.6f} =====")
+
+params = {
+    'bootstrap_type': 'Poisson',
+    'loss_function': 'Logloss',
+    'eval_metric': 'Logloss',
+    'random_seed': SEED,
+    'task_type': 'GPU',
+    'max_depth': 8,
+    'learning_rate': 0.01,
+    'n_estimators': N_ESTIMATORS,
+    'max_bin': 280,
+    'min_data_in_leaf': 64,
+    'l2_leaf_reg': 0.01,
+    'subsample': 0.8
+}
+
+ctb_oof = np.zeros(train_df.shape[0])
+ctb_preds = np.zeros(test_df.shape[0])
+feature_importances = pd.DataFrame()
+
+skf = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=SEED)
+
+for fold, (train_idx, valid_idx) in enumerate(skf.split(all_df, all_df[TARGET])):
+    print(f"===== FOLD {fold} =====")
+    oof_idx = np.array([idx for idx in valid_idx if idx < train_df.shape[0]])
+    preds_idx = np.array([idx for idx in valid_idx if idx >= train_df.shape[0]])
+
+    X_train, y_train = all_df.iloc[train_idx].drop(TARGET, axis=1), all_df.iloc[train_idx][TARGET]
+    X_valid, y_valid = all_df.iloc[oof_idx].drop(TARGET, axis=1), all_df.iloc[oof_idx][TARGET]
+    X_test = all_df.iloc[preds_idx].drop(TARGET, axis=1)
+    
+    model = ctb.CatBoostClassifier(**params)
+    model.fit(X_train, y_train,
+              eval_set=[(X_valid, y_valid)],
+              use_best_model=True,
+              early_stopping_rounds=EARLY_STOPPING_ROUNDS,
+              verbose=VERBOSE
+              )
+    
+    fi_tmp = pd.DataFrame()
+    fi_tmp["feature"] = X_test.columns.to_list()
+    fi_tmp["importance"] = model.get_feature_importance()
+    fi_tmp["fold"] = fold
+    fi_tmp["seed"] = SEED
+    feature_importances = feature_importances.append(fi_tmp)
+    
+    ctb_oof[oof_idx] = model.predict(X_valid)
+    ctb_preds[preds_idx-train_df.shape[0]] = model.predict(X_test)
+    
+    acc_score = accuracy_score(y_valid, np.where(ctb_oof[oof_idx]>0.5, 1, 0))
+    print(f"===== ACCURACY SCORE {acc_score:.6f} =====\n")
+    
+acc_score = accuracy_score(all_df[:train_df.shape[0]][TARGET], np.where(ctb_oof>0.5, 1, 0))
+print(f"===== ACCURACY SCORE {acc_score:.6f} =====")
+
+# Tuning the DecisionTreeClassifier by the GridSearchCV
+parameters = {
+    'max_depth': np.arange(2, 5, dtype=int),
+    # 'min_samples_leaf':  np.arange(2, 5, dtype=int)
+}
+
+classifier = LGBMClassifier(n_estimators=1000,device = 'gpu')
+# classifier = XGBClassifier(n_estimators=1000, learning_rate=0.017,n_jobs=8,
+#                      tree_method = 'gpu_hist',
+#                      predictor='gpu_predictor',
+#                      gpu_id=0,
+#                      )
 
 
-enc.fit(X_test[['Sex','Cabin','Name','Ticket','Embarked']])
-X_test[['Sex','Cabin','Name','Ticket','Embarked']] = enc.transform(X_test[['Sex','Cabin','Name','Ticket','Embarked']])
-scaler = preprocessing.StandardScaler().fit(X_train)
-X_train = scaler.transform(X_train)
+model = GridSearchCV(
+    estimator=classifier,
+    param_grid=parameters,
+    scoring='accuracy',
+    cv=10,
+    n_jobs=-1)
+model.fit(X_train, y_train)
 
-scaler = preprocessing.StandardScaler().fit(X_test)
-X_test = scaler.transform(X_test)
-from sklearn.ensemble import AdaBoostClassifier
-from sklearn.model_selection import cross_val_score
+best_parameters = model.best_params_
+print(best_parameters)
 
-from sklearn.experimental import enable_hist_gradient_boosting
-from sklearn.ensemble import HistGradientBoostingClassifier
+dtm_oof = np.zeros(train_df.shape[0])
+dtm_preds = np.zeros(test_df.shape[0])
+feature_importances = pd.DataFrame()
 
-# clf = HistGradientBoostingClassifier()
-# clf = AdaBoostClassifier(n_estimators=100)
+skf = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=SEED)
 
-clf
+for fold, (train_idx, valid_idx) in enumerate(skf.split(all_df, all_df[TARGET])):
+    print(f"===== FOLD {fold} =====")
+    oof_idx = np.array([idx for idx in valid_idx if idx < train_df.shape[0]])
+    preds_idx = np.array([idx for idx in valid_idx if idx >= train_df.shape[0]])
 
-clf.fit(X_train, y_train)
-scores = cross_val_score(clf, X_train, y_train, cv=5)
-scores.mean()
+    X_train, y_train = all_df.iloc[train_idx].drop(TARGET, axis=1), all_df.iloc[train_idx][TARGET]
+    X_valid, y_valid = all_df.iloc[oof_idx].drop(TARGET, axis=1), all_df.iloc[oof_idx][TARGET]
+    X_test = all_df.iloc[preds_idx].drop(TARGET, axis=1)
+    
+    from sklearn.ensemble import VotingClassifier
+    from sklearn.tree import DecisionTreeClassifier
+    from sklearn.ensemble import RandomForestClassifier, AdaBoostClassifier, ExtraTreesClassifier, BaggingClassifier, GradientBoostingClassifier
+    from sklearn.svm import SVC
+    from xgboost import XGBClassifier
+    from lightgbm import LGBMClassifier
+    from sklearn.neighbors import KNeighborsClassifier
+    from sklearn.linear_model import LogisticRegressionCV, RidgeClassifier
+    models = [
+    ('rfc', RandomForestClassifier()),
+    ('xgb', XGBClassifier()),
+    ('lgbm', LGBMClassifier(device='gpu')),
+    ('dtc', DecisionTreeClassifier())
+    ]
+    model  = VotingClassifier(models, voting='soft')
+    model.fit(X_train, y_train)
+    
+    dtm_oof[oof_idx] = model.predict(X_valid)
+    dtm_preds[preds_idx-train_df.shape[0]] = model.predict(X_test)
+    
+    acc_score = accuracy_score(y_valid, np.where(dtm_oof[oof_idx]>0.5, 1, 0))
+    print(f"===== ACCURACY SCORE {acc_score:.6f} =====\n")
+    
+acc_score = accuracy_score(all_df[:train_df.shape[0]][TARGET], np.where(dtm_oof>0.5, 1, 0))
+print(f"===== ACCURACY SCORE {acc_score:.6f} =====")
 
-predictions = clf.predict(X_test)
-sample_submission['Survived'] = predictions
-sample_submission.to_csv('submission1.csv',index=False)
+submission['submit_lgb'] = np.where(lgb_preds>0.5, 1, 0)
+submission['submit_ctb'] = np.where(ctb_preds>0.5, 1, 0)
+submission['submit_dtm'] = np.where(dtm_preds>0.5, 1, 0)
 
+submission[[col for col in submission.columns if col.startswith('submit_')]].sum(axis = 1).value_counts()
+
+submission[TARGET] = (submission[[col for col in submission.columns if col.startswith('submit_')]].sum(axis=1) >= 2).astype(int)
+submission.drop([col for col in submission.columns if col.startswith('submit_')], axis=1, inplace=True)
+
+submission['submit_1'] = submission[TARGET].copy()
+submission['submit_2'] = pd.read_csv("c:/data/kaggle/input/tabular-playground-series-apr-2021//dae.csv")[TARGET]
+submission['submit_3'] = pd.read_csv("c:/data/kaggle/input/tabular-playground-series-apr-2021//pseudo_label.csv")[TARGET]
+
+submission[[col for col in submission.columns if col.startswith('submit_')]].sum(axis = 1).value_counts()
+
+submission[TARGET] = (submission[[col for col in submission.columns if col.startswith('submit_')]].sum(axis=1) >= 2).astype(int)
+
+submission[['PassengerId', TARGET]].to_csv("c:/data/kaggle/input/tabular-playground-series-apr-2021/voting_submission5.csv", index = False)
